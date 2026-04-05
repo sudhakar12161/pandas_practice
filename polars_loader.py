@@ -10,6 +10,7 @@ from typing import Any
 
 import duckdb
 import polars as pl
+import pandas as pd
 
 from app.utils.constants import CLOUD_TYPES, DATABASE_TYPES, FILE_TYPES
 
@@ -130,9 +131,11 @@ class PolarsDataSourceLoader:
         enclosed_by = connection.get("field_enclosed_by")
 
         if conn_type.endswith("DELIMITED"):
-            return self._read_delimited_with_fallback(path, has_header, delimiter, enclosed_by)
+            df = self._read_delimited_with_fallback(path, has_header, delimiter, enclosed_by)
+            return self._normalize_columns(df)
         if conn_type.endswith("EXCEL"):
-            return pl.read_excel(path)
+            df = self._read_excel_with_fallback(path)
+            return self._normalize_columns(df)
         raise ValueError(f"Unsupported file type: {conn_type}")
 
     def _infer_database_schema(self, side: dict[str, Any]) -> dict[str, str]:
@@ -209,11 +212,13 @@ class PolarsDataSourceLoader:
                 quote_char=quote_char,
                 infer_schema_length=self.csv_infer_secondary,
                 ignore_errors=True,
+                truncate_ragged_lines=True,
+                null_values=["", "NULL", "null", "N/A", "n/a"],
                 try_parse_dates=False,
             )
         else:
             df = self._load_file(path, conn_type, connection)
-        return {name: str(dtype) for name, dtype in df.schema.items()}
+        return {name: str(dtype) for name, dtype in self._normalize_columns(df).schema.items()}
 
     def _apply_schema(self, df: pl.DataFrame, schema_def: dict[str, str]) -> pl.DataFrame:
         casts: list[pl.Expr] = []
@@ -286,22 +291,34 @@ class PolarsDataSourceLoader:
         enclosed_by: str | None,
     ) -> pl.DataFrame:
         quote_char = None if enclosed_by in (None, "", "None") else str(enclosed_by)
+        encodings = ["utf8", "utf8-lossy"]
         try:
-            return pl.read_csv(
-                path,
-                has_header=has_header,
-                separator=delimiter,
-                quote_char=quote_char,
-                infer_schema_length=self.csv_infer_primary,
-                try_parse_dates=False,
-            )
+            for enc in encodings:
+                try:
+                    return pl.read_csv(
+                        path,
+                        has_header=has_header,
+                        separator=delimiter,
+                        quote_char=quote_char,
+                        infer_schema_length=self.csv_infer_primary,
+                        truncate_ragged_lines=True,
+                        null_values=["", "NULL", "null", "N/A", "n/a"],
+                        skip_rows_after_header=0,
+                        ignore_errors=False,
+                        try_parse_dates=False,
+                        encoding=enc,
+                    )
+                except Exception:
+                    continue
+            # If both strict encoding tries fail, trigger fallback below.
+            raise ValueError("CSV strict read failed for supported encodings")
         except Exception as exc:
             msg = str(exc).lower()
             is_parse_dtype_error = (
                 ("could not parse" in msg or "couldn't parse" in msg or "parse" in msg)
                 and ("dtype" in msg or "as dtype" in msg or "column" in msg)
             )
-            if is_parse_dtype_error:
+            if is_parse_dtype_error or "found more fields than defined in schema" in msg or "strict read failed" in msg:
                 self.logger.warning(
                     "Polars CSV parse error, retry with larger infer_schema_length=%s path=%s error=%s",
                     self.csv_infer_secondary,
@@ -309,37 +326,88 @@ class PolarsDataSourceLoader:
                     exc,
                 )
                 try:
-                    return pl.read_csv(
-                        path,
-                        has_header=has_header,
-                        separator=delimiter,
-                        quote_char=quote_char,
-                        infer_schema_length=self.csv_infer_secondary,
-                        try_parse_dates=False,
-                    )
+                    for enc in encodings:
+                        try:
+                            return pl.read_csv(
+                                path,
+                                has_header=has_header,
+                                separator=delimiter,
+                                quote_char=quote_char,
+                                infer_schema_length=self.csv_infer_secondary,
+                                truncate_ragged_lines=True,
+                                null_values=["", "NULL", "null", "N/A", "n/a"],
+                                try_parse_dates=False,
+                                encoding=enc,
+                            )
+                        except Exception:
+                            continue
+                    raise ValueError("CSV typed retry failed")
                 except Exception as exc2:
                     self.logger.warning("Polars CSV typed retry failed, fallback to all-string mode path=%s error=%s", path, exc2)
                     try:
-                        return pl.read_csv(
-                            path,
-                            has_header=has_header,
-                            separator=delimiter,
-                            quote_char=quote_char,
-                            infer_schema=False,
-                            try_parse_dates=False,
-                        )
+                        for enc in encodings:
+                            try:
+                                return pl.read_csv(
+                                    path,
+                                    has_header=has_header,
+                                    separator=delimiter,
+                                    quote_char=quote_char,
+                                    infer_schema=False,
+                                    truncate_ragged_lines=True,
+                                    null_values=["", "NULL", "null", "N/A", "n/a"],
+                                    try_parse_dates=False,
+                                    encoding=enc,
+                                )
+                            except Exception:
+                                continue
+                        raise ValueError("CSV all-string fallback failed")
                     except Exception as exc3:
                         self.logger.warning("Polars CSV all-string fallback failed, retry with ignore_errors path=%s error=%s", path, exc3)
-                        return pl.read_csv(
-                            path,
-                            has_header=has_header,
-                            separator=delimiter,
-                            quote_char=quote_char,
-                            infer_schema=False,
-                            try_parse_dates=False,
-                            ignore_errors=True,
-                        )
+                        for enc in encodings:
+                            try:
+                                return pl.read_csv(
+                                    path,
+                                    has_header=has_header,
+                                    separator=delimiter,
+                                    quote_char=quote_char,
+                                    infer_schema=False,
+                                    try_parse_dates=False,
+                                    ignore_errors=True,
+                                    truncate_ragged_lines=True,
+                                    null_values=["", "NULL", "null", "N/A", "n/a"],
+                                    encoding=enc,
+                                )
+                            except Exception:
+                                continue
+                        raise
             raise
+
+    def _read_excel_with_fallback(self, path: str) -> pl.DataFrame:
+        try:
+            # Read first sheet by default to keep behavior deterministic.
+            return pl.read_excel(path, sheet_id=1)
+        except Exception as exc:
+            self.logger.warning("Polars Excel read failed, fallback to pandas path=%s error=%s", path, exc)
+            try:
+                pdf = pd.read_excel(path, sheet_name=0)
+                return pl.from_pandas(pdf, include_index=False)
+            except Exception:
+                raise
+
+    def _normalize_columns(self, df: pl.DataFrame) -> pl.DataFrame:
+        renamed: dict[str, str] = {}
+        used: dict[str, int] = {}
+        for idx, original in enumerate(df.columns):
+            base = (str(original).strip() or f"COL_{idx + 1}").replace("\ufeff", "")
+            if base in used:
+                used[base] += 1
+                name = f"{base}_{used[base]}"
+            else:
+                used[base] = 1
+                name = base
+            if original != name:
+                renamed[original] = name
+        return df.rename(renamed) if renamed else df
 
     def _raise_snowflake_optional_dependency_error(self, exc: Exception) -> None:
         msg = str(exc).lower()
